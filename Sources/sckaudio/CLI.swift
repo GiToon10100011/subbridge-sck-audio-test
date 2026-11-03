@@ -12,6 +12,7 @@ struct RecordOptions {
     var output: URL?
     var format: AudioFileFormat?
     var duration: TimeInterval?
+    var picker = false
     var config = CaptureConfig()
 }
 
@@ -19,6 +20,25 @@ enum StopReason {
     case signal
     case duration
     case streamError(Error)
+}
+
+/// 신호 핸들러가 (나중에 만들어지는) 선택기를 깨울 수 있게 이어 두는 고리.
+final class SignalHook {
+    private let lock = NSLock()
+    private var action: (() -> Void)?
+
+    func set(_ action: (() -> Void)?) {
+        lock.lock()
+        self.action = action
+        lock.unlock()
+    }
+
+    func fire() {
+        lock.lock()
+        let a = action
+        lock.unlock()
+        a?()
+    }
 }
 
 enum CLI {
@@ -39,6 +59,7 @@ enum CLI {
       --rate <Hz>                      샘플레이트 (기본 48000)
       --channels 1|2                   채널 수 (기본 2)
       --include-self                   이 프로세스의 오디오도 포함 (기본: 제외)
+      --picker                         macOS 선택기(단일 창)로 캡처할 창을 고른다 (macOS 14+). --app 과 함께 쓸 수 없음
     """
 
     static func run(_ args: [String]) async -> Int32 {
@@ -127,10 +148,15 @@ enum CLI {
                 o.config.channels = c
             case "--include-self":
                 o.config.includeSelf = true
+            case "--picker":
+                o.picker = true
             default:
                 throw CLIError(message: "알 수 없는 옵션: \(flag)", exitCode: 64)
             }
             i += 1
+        }
+        if o.picker && !o.apps.isEmpty {
+            throw CLIError(message: "--picker 와 --app 은 함께 쓸 수 없습니다", exitCode: 64)
         }
         return o
     }
@@ -186,15 +212,25 @@ enum CLI {
             throw CLIError(message: "이미 존재하는 파일입니다: \(url.path)")
         }
 
+        if o.picker, #unavailable(macOS 14.0) {
+            throw CLIError(message: "--picker 는 macOS 14 이상에서만 쓸 수 있습니다")
+        }
+
         if !CGPreflightScreenCaptureAccess() {
             fputs("경고: 화면 녹화 권한이 없는 것으로 보입니다. 계속 시도합니다 (`sckaudio check` 참고).\n", stderr)
         }
 
-        let content = try await shareableContent()
-        guard let display = content.displays.first else {
-            throw CLIError(message: "캡처할 디스플레이가 없습니다")
+        // --picker 는 선택기가 돌려준 필터를 쓰므로 디스플레이 · 앱을 해석하지 않는다.
+        var display: SCDisplay?
+        var apps: [SCRunningApplication] = []
+        if !o.picker {
+            let content = try await shareableContent()
+            guard let first = content.displays.first else {
+                throw CLIError(message: "캡처할 디스플레이가 없습니다")
+            }
+            display = first
+            apps = try resolveApps(o.apps, in: content)
         }
-        let apps = try resolveApps(o.apps, in: content)
 
         let writer = AudioFileWriter(url: url, format: format)
         let capture = AudioCapture(config: o.config, writer: writer)
@@ -205,22 +241,45 @@ enum CLI {
         let queue = DispatchQueue(label: "sckaudio.control")
         signal(SIGINT, SIG_IGN)
         signal(SIGTERM, SIG_IGN)
+        let signalHook = SignalHook()
         let signalSources = [SIGINT, SIGTERM].map { sig -> DispatchSourceSignal in
             let src = DispatchSource.makeSignalSource(signal: sig, queue: queue)
-            src.setEventHandler { continuation.yield(.signal) }
+            src.setEventHandler {
+                continuation.yield(.signal)
+                signalHook.fire()  // 선택기를 기다리는 중이면 깨운다
+            }
             src.resume()
             return src
         }
 
+        // 선택기는 선택이 끝나야 캡처가 시작된다. 취소와 대기 중 Ctrl-C 는 캡처 없이 종료 코드 3 으로 끝난다.
+        var pickedFilter: SCContentFilter?
+        if o.picker, #available(macOS 14.0, *) {
+            guard let filter = try await pickWindow(onSignal: signalHook) else {
+                signalSources.forEach { $0.cancel() }
+                return 3
+            }
+            pickedFilter = filter
+        }
+
         do {
-            try await capture.start(display: display, apps: apps)
+            if let filter = pickedFilter {
+                try await capture.start(filter: filter)
+            } else if let display {
+                try await capture.start(display: display, apps: apps)
+            }
         } catch {
             throw translate(error)
         }
 
-        let target = apps.isEmpty
-            ? "시스템 전체"
-            : apps.map { "\($0.applicationName)(pid \($0.processID))" }.joined(separator: ", ")
+        let target: String
+        if pickedFilter != nil {
+            target = "선택기에서 고른 창"
+        } else if apps.isEmpty {
+            target = "시스템 전체"
+        } else {
+            target = apps.map { "\($0.applicationName)(pid \($0.processID))" }.joined(separator: ", ")
+        }
         let requestedFormat = "\(o.config.sampleRate)Hz \(o.config.channels)ch"
         fputs("캡처 시작 — 대상: \(target)\n", stderr)
         fputs("요청 포맷: \(requestedFormat) → \(url.path)\n", stderr)
@@ -251,6 +310,35 @@ enum CLI {
             fputs("\n스트림이 시스템에 의해 중지됨: \(e.localizedDescription)\n", stderr)
         }
         return reporter.summary(url: url, wroteFile: writer.hasWritten)
+    }
+
+    /// 선택기를 띄워 창 하나를 고르게 한다. 취소 · Ctrl-C 면 메시지를 출력하고 nil 을 돌려준다.
+    @available(macOS 14.0, *)
+    static func pickWindow(onSignal hook: SignalHook) async throws -> SCContentFilter? {
+        let picker = ContentPicker()
+        hook.set { picker.cancel() }
+        defer { hook.set(nil) }
+
+        fputs("창 선택기를 엽니다 — 오디오를 캡처할 창을 하나 고르세요 (취소: 선택기에서 취소 또는 Ctrl-C)\n", stderr)
+        let outcome: PickerOutcome
+        do {
+            outcome = try await picker.pick()
+        } catch {
+            throw CLIError(message: "창 선택기를 실행하지 못했습니다: \(error.localizedDescription)")
+        }
+
+        switch outcome {
+        case .selected(let filter):
+            fputs("선택됨:\n", stderr)
+            for line in ContentPicker.describe(filter) { fputs("  \(line)\n", stderr) }
+            return filter
+        case .cancelled:
+            fputs("선택이 취소되었습니다 — 캡처하지 않고 종료합니다.\n", stderr)
+            return nil
+        case .interrupted:
+            fputs("선택 대기 중 Ctrl-C 로 중단했습니다 — 캡처하지 않고 종료합니다.\n", stderr)
+            return nil
+        }
     }
 
     // MARK: 도우미
@@ -339,6 +427,16 @@ final class StatusReporter {
     private var ticks: [State: Int] = [:]
     private var printedAny = false
 
+    /// 같은 상태가 이어진 구간. 시각은 캡처 시작 기준 초이며 틱(0.5초) 격자에 맞춘다.
+    private struct Segment {
+        var state: State
+        var start: Double
+        var end: Double
+        var peak: Float  // 구간 안에서 본 가장 큰 피크 (선형)
+    }
+    private var segments: [Segment] = []
+    private var tickCount = 0
+
     init(meter: LevelMeter, sampleRate: Double) {
         self.meter = meter
         self.sampleRate = sampleRate
@@ -348,6 +446,15 @@ final class StatusReporter {
         let s = meter.snapshot(resetWindow: true)
         let state = Self.state(of: s)
         ticks[state, default: 0] += 1
+
+        tickCount += 1
+        let tickEnd = Double(tickCount) * Self.tick
+        if let last = segments.last, last.state == state {
+            segments[segments.count - 1].end = tickEnd
+            segments[segments.count - 1].peak = max(last.peak, s.windowPeak)
+        } else {
+            segments.append(Segment(state: state, start: tickEnd - Self.tick, end: tickEnd, peak: s.windowPeak))
+        }
 
         let elapsed = ProcessInfo.processInfo.systemUptime - started
         let captured = Double(s.frames) / sampleRate
@@ -377,6 +484,13 @@ final class StatusReporter {
 
         print("── 요약 ──")
         print("상태별 시간(초): ACTIVE \(secs(.active)) / SILENT \(secs(.silent)) / STALLED \(secs(.stalled)) / WAITING \(secs(.waiting))")
+        if !segments.isEmpty {
+            print("상태 타임라인 (캡처 시작 기준, 0.5초 해상도):")
+            for seg in segments {
+                let state = seg.state.rawValue.padding(toLength: 7, withPad: " ", startingAt: 0)
+                print("  \(Self.clock(seg.start))~\(Self.clock(seg.end))  \(state)  구간 최대 피크 \(dbfs(seg.peak)) dBFS")
+            }
+        }
         print("받은 버퍼 \(s.buffers)개, 프레임 \(s.frames) (\(String(format: "%.2f", Double(s.frames) / sampleRate))초 분량), 포맷 \(s.formatDescription)")
         print("최대 피크 \(dbfs(s.maxPeak)) dBFS")
 

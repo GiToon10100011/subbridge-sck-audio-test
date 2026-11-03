@@ -36,7 +36,11 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         } else {
             filter = SCContentFilter(display: display, including: apps, exceptingWindows: [])
         }
+        try await start(filter: filter)
+    }
 
+    /// 이미 만들어진 필터(예: 콘텐츠 선택기가 돌려준 필터)로 캡처를 시작한다.
+    func start(filter: SCContentFilter) async throws {
         let cfg = SCStreamConfiguration()
         cfg.capturesAudio = true
         cfg.excludesCurrentProcessAudio = !config.includeSelf
