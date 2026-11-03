@@ -1,0 +1,12 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Audio recordings
+*.wav
+*.m4a
+*.mp3
+*.caf
+
+# macOS
+.DS_Store
